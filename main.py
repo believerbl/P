@@ -8,6 +8,23 @@ from collections import deque
 import os
 from flask import Flask
 from threading import Thread
+import logging
+import sys
+
+# ==========================================
+# 0. LOGGING CONFIGURATION
+# ==========================================
+# Configure logging to output to standard output (console)
+# Format: [Time] [Level] Message
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("ProjectP")
 
 # ==========================================
 # 1. FLASK KEEP-ALIVE (For Render)
@@ -21,6 +38,9 @@ def home():
 def run_http():
     # Render automatically sets the 'PORT' environment variable
     port = int(os.environ.get("PORT", 8080))
+    # Disable Flask's default request logging to keep console clean
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
@@ -53,7 +73,7 @@ MIN_TRADES_STATS = 50  # Trades needed before showing Win Rate
 def send_telegram(message):
     """Sends a notification to your Telegram App."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"Telegram not configured. Log: {message}")
+        logger.warning(f"Telegram not configured. Log: {message}")
         return
     
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -61,7 +81,7 @@ def send_telegram(message):
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"Telegram Error: {e}")
+        logger.error(f"Telegram Error: {e}")
 
 # ==========================================
 # 4. DATA MANAGEMENT (The Senses)
@@ -85,7 +105,7 @@ class DataManager:
             resp_price = requests.get(url_price).json()
             
             if 'price' not in resp_price:
-                print(f"[Error] API Fetch Failed: {resp_price}")
+                logger.error(f"API Fetch Failed: {resp_price}")
                 return None, None
                 
             current_price = float(resp_price['price'])
@@ -112,7 +132,7 @@ class DataManager:
             return normalized_packet, current_price
 
         except Exception as e:
-            print(f"[Error] Exception in fetch: {e}")
+            logger.error(f"Exception in fetch: {e}")
             return None, None
 
     def get_input_tensor(self):
@@ -173,7 +193,7 @@ if __name__ == "__main__":
     pending_trades = []                 # Delayed Reward Buffer
 
     # 3. Branding Startup
-    print("--- PROJECT P: ONLINE ---")
+    logger.info("--- PROJECT P: ONLINE ---")
     send_telegram("🚀 PROJECT P: Online.\nSystem: LSTM-RL Hybrid\nTarget: Nifty 50\nState: Initializing...")
 
     # 4. Infinite Loop
@@ -219,7 +239,7 @@ if __name__ == "__main__":
                     
                     # E. Cleanup
                     pending_trades.remove(trade)
-                    print(f" > Verifying T-30m: {'WIN' if did_win else 'LOSS'} (Reward: {reward})")
+                    logger.info(f"Verifying T-30m: {'WIN' if did_win else 'LOSS'} (Reward: {reward})")
 
             # --- PHASE 3: PREDICT (Future Probability) ---
             # Only predict if we have gathered enough initial data
@@ -247,7 +267,7 @@ if __name__ == "__main__":
                     f"Active Memory: {len(data_manager.history)}/10"
                 )
                 
-                print(msg)
+                logger.info(f"Prediction: {direction} | Price: {current_price} | WinRate: {win_rate}")
                 send_telegram(msg)
                 
                 # Store for future validation
@@ -259,11 +279,11 @@ if __name__ == "__main__":
                 })
 
         else:
-            print("Data Fetch Error. Retrying next cycle.")
+            logger.warning("Data Fetch Error. Retrying next cycle.")
 
         # --- PHASE 4: WAIT ---
         # Sleep for remainder of 5 minutes (300 seconds)
         elapsed = time.time() - loop_start
         sleep_duration = max(0, 300 - elapsed)
-        print(f"Sleeping for {int(sleep_duration)}s...")
+        logger.info(f"Sleeping for {int(sleep_duration)}s...")
         time.sleep(sleep_duration)
