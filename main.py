@@ -15,7 +15,6 @@ import sys
 # 0. LOGGING CONFIGURATION
 # ==========================================
 # Configure logging to output to standard output (console)
-# Format: [Time] [Level] Message
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] [%(levelname)s] %(message)s',
@@ -56,7 +55,10 @@ API_KEY = os.environ.get("TWELVEDATA_API_KEY", "YOUR_API_KEY_HERE")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-SYMBOL = "NSE/NIFTY"
+# API CONFIGURATION
+# Note: "Nifty%2050" encodes the space for the URL.
+SYMBOL = "Nifty%2050" 
+EXCHANGE = "NSE"
 TIMEFRAMES = ["1day", "4h", "1h", "5min"] 
 
 # Hyperparameters
@@ -101,7 +103,8 @@ class DataManager:
         
         try:
             # A. Fetch Current Price
-            url_price = f"https://api.twelvedata.com/price?symbol={SYMBOL}&apikey={API_KEY}"
+            # We add &exchange=NSE to ensure we get the Indian Index
+            url_price = f"https://api.twelvedata.com/price?symbol={SYMBOL}&exchange={EXCHANGE}&apikey={API_KEY}"
             resp_price = requests.get(url_price).json()
             
             if 'price' not in resp_price:
@@ -112,7 +115,8 @@ class DataManager:
 
             # B. Fetch Candles (Sequentially to ensure data integrity)
             for interval in TIMEFRAMES:
-                url_ts = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={interval}&outputsize=1&apikey={API_KEY}"
+                # We add &exchange=NSE here as well
+                url_ts = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&exchange={EXCHANGE}&interval={interval}&outputsize=1&apikey={API_KEY}"
                 resp_ts = requests.get(url_ts).json()
                 
                 if 'values' in resp_ts:
