@@ -2,3 +2,6 @@ flask
 requests
 numpy
 torch
+NorenRestApiPy
+pyotp
+websocket-client
