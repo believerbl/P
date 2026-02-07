@@ -35,9 +35,8 @@ def home():
     return "PROJECT P: SHOONYA LINK ACTIVE"
 
 def run_http():
-    # Render sets PORT automatically
     port = int(os.environ.get("PORT", 8080))
-    # Silence Flask logs
+    # Silence Flask logs to keep console clean
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
     app.run(host='0.0.0.0', port=port)
@@ -123,7 +122,7 @@ class DataManager:
                 twoFA=totp, 
                 vendor_code=SHOONYA_VC, 
                 api_secret=SHOONYA_API_KEY, 
-                imei='12345' # Random IMEI is fine
+                imei='12345'
             )
             
             if ret and 'stat' in ret and ret['stat'] == 'Ok':
@@ -142,6 +141,7 @@ class DataManager:
         """
         Fetches: [Daily, 60m, 30m, 5m, Current_Price]
         Returns normalized packet and raw current price.
+        Includes Weekend Fallback Logic.
         """
         # Session Refresh: If login is older than 20 hours, re-login
         if time.time() - self.last_login_time > 72000: 
@@ -152,31 +152,45 @@ class DataManager:
         current_price = 0.0
         
         try:
-            # 1. Fetch Current Price (LTP)
-            # We use get_quotes for the absolute latest tick
+            # --- 1. FETCH CURRENT PRICE (With Fallback) ---
+            # Attempt A: Live Quote
             quote = self.api.get_quotes(exchange=EXCHANGE, token=TOKEN_NIFTY)
             
-            if not quote or 'stat' not in quote or quote['stat'] != 'Ok':
-                logger.warning(f"Failed to get Quote: {quote}")
-                # Attempt immediate re-login if quote fails
-                self.login()
-                return None, None
+            if quote and 'stat' in quote and quote['stat'] == 'Ok':
+                if 'lp' in quote:
+                    current_price = float(quote['lp'])
+                else:
+                    current_price = float(quote.get('c', 0.0)) # Close price if LP missing
             
-            # 'lp' stands for Last Traded Price
-            if 'lp' in quote:
-                current_price = float(quote['lp'])
-            else:
-                # Sometimes indexes use 'c' for close if market is shut
-                current_price = float(quote.get('c', 0.0))
-
+            # Attempt B: Fallback to History (If Live Quote failed)
             if current_price == 0.0:
-                logger.error("Fetched Price is 0.0. Aborting.")
-                return None, None
+                logger.warning("Live Quote failed (Weekend/Closed?). Using History Fallback...")
+                
+                # Look back 5 days to find the last valid trading minute
+                end_time = datetime.datetime.now()
+                start_time = end_time - datetime.timedelta(days=5) 
+                
+                # Fetch 1-minute candles
+                fallback_hist = self.api.get_time_price_series(
+                    exchange=EXCHANGE, 
+                    token=TOKEN_NIFTY, 
+                    starttime=start_time.timestamp(), 
+                    interval='1'
+                )
+                
+                if fallback_hist:
+                    # Sort by time and take the absolute last candle
+                    sorted_fb = sorted(fallback_hist, key=lambda x: x['time'])
+                    last_candle = sorted_fb[-1]
+                    current_price = float(last_candle['intc'])
+                    logger.info(f"✅ Fallback Successful. Last Known Price: {current_price}")
+                else:
+                    logger.error("❌ Critical: Both Quote and History Fallback failed.")
+                    return None, None
 
-            # 2. Fetch History Candles (Daily, 60m, 30m, 5m)
+            # --- 2. FETCH HISTORY CANDLES (Daily, 60m, 30m, 5m) ---
             # We fetch 5 days back to ensure we find data
-            start_time = datetime.datetime.now() - datetime.timedelta(days=5)
-            start_ts = start_time.timestamp()
+            start_ts = (datetime.datetime.now() - datetime.timedelta(days=5)).timestamp()
             
             # Shoonya Interval Codes
             intervals = ['d', '60', '30', '5']
@@ -190,29 +204,27 @@ class DataManager:
                 )
                 
                 if hist:
-                    # History is usually returned latest-first or oldest-first.
-                    # We sort by time to be sure and take the last one [-1]
+                    # Sort and pick latest
                     sorted_hist = sorted(hist, key=lambda x: x['time'])
                     latest_candle = sorted_hist[-1]
-                    
-                    # 'intc' is the close price of that candle
                     close_val = float(latest_candle['intc'])
                     packet.append(close_val)
                 else:
-                    # Fallback: If history fetch fails, use current price to prevent crash
+                    # Fallback if specific timeframe fails
                     packet.append(current_price)
             
             # 3. Add Current Price as the 5th Input
             packet.append(current_price)
 
             # 4. Normalization: [(Value - Current) / Current]
-            # This makes the data digestible for the Neural Network
             normalized_packet = [(p - current_price) / current_price for p in packet]
             
             return normalized_packet, current_price
 
         except Exception as e:
             logger.error(f"Fetch Exception: {e}")
+            # Try immediate re-login if fetch crashed
+            self.login()
             return None, None
 
     def get_input_tensor(self):
