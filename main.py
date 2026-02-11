@@ -12,6 +12,7 @@ import logging
 import sys
 import datetime
 import pyotp
+import json
 from NorenRestApiPy.NorenApi import NorenApi
 
 # ==========================================
@@ -26,17 +27,16 @@ logging.basicConfig(
 logger = logging.getLogger("ProjectP")
 
 # ==========================================
-# 1. FLASK KEEP-ALIVE (For Render)
+# 1. FLASK KEEP-ALIVE
 # ==========================================
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "PROJECT P: SYSTEMS NOMINAL"
+    return "PROJECT P: SYSTEMS ONLINE"
 
 def run_http():
     port = int(os.environ.get("PORT", 8080))
-    # Silence Flask logs to keep console clean
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
     app.run(host='0.0.0.0', port=port)
@@ -46,24 +46,24 @@ def keep_alive():
     t.start()
 
 # ==========================================
-# 2. CONFIGURATION & CREDENTIALS
+# 2. CONFIGURATION
 # ==========================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Shoonya Credentials
-SHOONYA_USER_ID = os.environ.get("SHOONYA_USER_ID", "YOUR_USER_ID")
-SHOONYA_PASSWORD = os.environ.get("SHOONYA_PASSWORD", "YOUR_PWD")
-SHOONYA_TOTP_SECRET = os.environ.get("SHOONYA_TOTP_SECRET", "YOUR_TOTP")
-SHOONYA_VC = os.environ.get("SHOONYA_VC", "YOUR_VC_CODE")
-SHOONYA_API_KEY = os.environ.get("SHOONYA_API_KEY", "YOUR_API_KEY")
+SHOONYA_USER_ID = os.environ.get("SHOONYA_USER_ID", "")
+SHOONYA_PASSWORD = os.environ.get("SHOONYA_PASSWORD", "")
+SHOONYA_TOTP_SECRET = os.environ.get("SHOONYA_TOTP_SECRET", "")
+SHOONYA_VC = os.environ.get("SHOONYA_VC", "")
+SHOONYA_API_KEY = os.environ.get("SHOONYA_API_KEY", "")
 
-TOKEN_NIFTY = '26000' # Nifty 50 Spot Token
+TOKEN_NIFTY = '26000' 
 EXCHANGE = 'NSE'
 
 # Hyperparameters
 INPUT_SEQ_LEN = 10     
-INPUT_FEATURES = 5     # Daily, 60m, 30m, 5m, Current
+INPUT_FEATURES = 5     
 HIDDEN_SIZE = 64       
 LEARNING_RATE = 0.001
 DELAY_SECONDS = 1800   # 30 Minutes
@@ -82,8 +82,23 @@ def send_telegram(message):
     except Exception:
         pass
 
+def parse_shoonya_time(time_str):
+    """Robust timestamp parser for mixed formats"""
+    try:
+        # Try converting direct epoch string (e.g. '167...')
+        return float(time_str)
+    except ValueError:
+        try:
+            # Try parsing date string (e.g. '10-02-2026 15:15:00')
+            # Adjust format if Shoonya sends something different
+            dt_obj = datetime.datetime.strptime(time_str, '%d-%m-%Y %H:%M:%S')
+            return dt_obj.timestamp()
+        except Exception as e:
+            logger.warning(f"Time Parse Error for '{time_str}': {e}")
+            return time.time() # Fallback to current time
+
 # ==========================================
-# 4. DATA MANAGEMENT (SMART LOGIC)
+# 4. DATA MANAGEMENT (FIXED)
 # ==========================================
 class DataManager:
     def __init__(self):
@@ -91,12 +106,12 @@ class DataManager:
         self.api = NorenApi(host='https://api.shoonya.com/NorenWClientTP/', 
                            websocket='wss://api.shoonya.com/NorenWSTP/')
         self.last_login_time = 0
+        self.last_price = 0.0 # To check for stale data
         self.login()
 
     def login(self):
         try:
             if not SHOONYA_TOTP_SECRET or not SHOONYA_USER_ID:
-                logger.error("Credentials Missing!")
                 return False
 
             totp = pyotp.TOTP(SHOONYA_TOTP_SECRET).now()
@@ -111,17 +126,14 @@ class DataManager:
                 self.last_login_time = time.time()
                 return True
             else:
-                logger.error(f"❌ Login Failed: {ret}")
                 return False
-        except Exception as e:
-            logger.error(f"Login Error: {e}")
+        except Exception:
             return False
 
     def fetch_market_data(self):
         """
-        Fetches: [Daily, 60m, 30m, 5m, Current]
-        Logic 1: Only COMPLETED candles.
-        Logic 2: Returns None if market is closed (Stale Data).
+        Fetches data with robust error handling.
+        Returns: (packet, current_price, is_active)
         """
         # Session Refresh
         if time.time() - self.last_login_time > 72000: self.login()
@@ -133,22 +145,29 @@ class DataManager:
         try:
             # --- A. Get LIVE Price ---
             quote = self.api.get_quotes(exchange=EXCHANGE, token=TOKEN_NIFTY)
+            
             if quote and 'lp' in quote:
                 current_price = float(quote['lp'])
-                # Check freshness of this quote (approx)
-                # If Quote Time is missing, we assume it's live if 'stat' is Ok.
             else:
-                # If Live fails, try History Fallback to check if market is just closed
-                # But do NOT use this data for training.
-                return None, None 
+                # If Live fails, try fallback but mark as possibly stale
+                return None, None, False
 
-            # --- B. Get History (COMPLETED CANDLES ONLY) ---
-            # Define intervals and durations (seconds)
+            # --- CRITICAL: STALE DATA CHECK ---
+            # If price hasn't moved since last loop, Market is likely closed/frozen.
+            # We allow small float differences, but exact match usually means frozen.
+            if current_price == self.last_price:
+                 # Logic: If exact same price, assume no activity.
+                 # This prevents the "Loss loop" on weekends.
+                 return None, current_price, False
+            
+            self.last_price = current_price
+
+            # --- B. Get History ---
             timeframes = [
-                {'iv': 'd',  'dur': 0},      # Daily (Special check)
-                {'iv': '60', 'dur': 3600},   # 1 Hour
-                {'iv': '30', 'dur': 1800},   # 30 Mins
-                {'iv': '5',  'dur': 300}     # 5 Mins
+                {'iv': 'd',  'dur': 0},      
+                {'iv': '60', 'dur': 3600},   
+                {'iv': '30', 'dur': 1800},   
+                {'iv': '5',  'dur': 300}     
             ]
             
             start_ts = (datetime.datetime.now() - datetime.timedelta(days=5)).timestamp()
@@ -157,27 +176,29 @@ class DataManager:
                 iv = tf['iv']
                 duration = tf['dur']
                 
-                hist = self.api.get_time_price_series(exchange=EXCHANGE, token=TOKEN_NIFTY, starttime=start_ts, interval=iv)
+                # Try/Except block specifically for History API calls
+                try:
+                    hist = self.api.get_time_price_series(exchange=EXCHANGE, token=TOKEN_NIFTY, starttime=start_ts, interval=iv)
+                except Exception:
+                    hist = None
                 
-                selected_val = current_price # Default
+                selected_val = current_price 
 
                 if hist:
-                    # Sort time ascending
-                    sorted_hist = sorted(hist, key=lambda x: float(x['time']))
+                    # Sort using the robust parser
+                    sorted_hist = sorted(hist, key=lambda x: parse_shoonya_time(x['time']))
                     
-                    # Find last COMPLETED candle
                     for candle in reversed(sorted_hist):
-                        c_time = float(candle['time'])
+                        # Use the robust parser here too
+                        c_time = parse_shoonya_time(candle['time'])
                         
                         if iv == 'd':
-                            # Daily: Strictly BEFORE today's date
                             c_date = datetime.datetime.fromtimestamp(c_time).date()
                             today_date = datetime.datetime.now().date()
                             if c_date < today_date:
                                 selected_val = float(candle['intc'])
                                 break
                         else:
-                            # Intraday: OpenTime + Duration <= CurrentTime
                             candle_close_time = c_time + duration
                             if candle_close_time <= current_ts:
                                 selected_val = float(candle['intc'])
@@ -187,25 +208,20 @@ class DataManager:
 
             # --- C. Final Assembly ---
             packet.append(current_price)
-
-            # --- D. Market Status Check ---
-            # Fetch last 1m candle to verify data freshness
-            last_1m = self.api.get_time_price_series(exchange=EXCHANGE, token=TOKEN_NIFTY, starttime=start_ts, interval='1')
-            if last_1m:
-                last_trade_time = float(sorted(last_1m, key=lambda x: x['time'])[-1]['time'])
-                # If data is older than 15 mins (900s), Market is CLOSED.
-                if (current_ts - last_trade_time) > 900:
-                    logger.info("💤 Market Closed (Data Stale). Pausing...")
-                    return None, None
-
+            
             # Normalize
             normalized_packet = [(p - current_price) / current_price for p in packet]
-            return normalized_packet, current_price
+            
+            return normalized_packet, current_price, True
 
         except Exception as e:
-            logger.error(f"Fetch Error: {e}")
+            # Catch JSON errors or connection drops silently
+            if "Expecting value" in str(e):
+                logger.warning("Shoonya API Maintenance (JSON Error). Sleeping.")
+            else:
+                logger.error(f"Fetch Error: {e}")
             self.login()
-            return None, None
+            return None, None, False
 
     def get_input_tensor(self):
         data_list = list(self.history)
@@ -240,23 +256,29 @@ if __name__ == "__main__":
     win_loss_queue = deque(maxlen=1000) 
     pending_trades = []                 
 
-    logger.info("--- PROJECT P: FINAL LOGIC ONLINE ---")
-    send_telegram("🚀 PROJECT P: Online.\nStatus: Waiting for Market Open...")
+    logger.info("--- PROJECT P: REBOOTED ---")
+    send_telegram("🚀 PROJECT P: Online.\nStatus: Monitoring Market...")
 
     while True:
         loop_start = time.time()
         
-        # 1. Sense (Returns None if Market Closed)
-        packet, current_price = data_manager.fetch_market_data()
+        # 1. Sense
+        packet, current_price, is_active = data_manager.fetch_market_data()
         
-        if packet:
-            # MARKET IS OPEN
+        if is_active and packet:
+            # MARKET IS OPEN AND MOVING
             data_manager.history.append(packet)
             
             # 2. Learn
             for trade in pending_trades[:]:
                 if loop_start - trade['timestamp'] >= DELAY_SECONDS:
                     diff = current_price - trade['entry_price']
+                    
+                    # Ignore trades with 0.0 difference (prevents fake losses on flat markets)
+                    if abs(diff) < 0.5: 
+                        pending_trades.remove(trade)
+                        continue
+
                     did_win = (trade['action'] == 1 and diff > 0) or (trade['action'] == 0 and diff < 0)
                     win_loss_queue.append(1 if did_win else 0)
                     
@@ -268,7 +290,7 @@ if __name__ == "__main__":
                     loss.backward()
                     optimizer.step()
                     pending_trades.remove(trade)
-                    logger.info(f" > Training: {'WIN' if did_win else 'LOSS'}")
+                    logger.info(f" > Training: {'WIN' if did_win else 'LOSS'} (Diff: {diff:.2f})")
 
             # 3. Predict
             if len(data_manager.history) > 0:
@@ -290,7 +312,8 @@ if __name__ == "__main__":
                     'entry_price': current_price
                 })
         else:
-            # MARKET IS CLOSED - Do nothing, just wait.
+            # MARKET IS CLOSED / STAGNANT
+            logger.info(f"💤 Market Idle. Last Price: {current_price if current_price else 'Unknown'}")
             pass
 
         # 4. Wait
