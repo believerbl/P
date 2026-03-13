@@ -15,6 +15,9 @@ import datetime
 import pyotp
 import json
 from NorenRestApiPy.NorenApi import NorenApi
+import pymongo
+import io
+from bson.binary import Binary
 
 # ==========================================
 # 0. LOGGING CONFIGURATION
@@ -51,6 +54,7 @@ def keep_alive():
 # ==========================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+MONGO_URI = os.environ.get("MONGO_URI", "")  # Add your MongoDB URI here
 
 # Shoonya Credentials
 SHOONYA_USER_ID = os.environ.get("SHOONYA_USER_ID", "")
@@ -62,17 +66,17 @@ SHOONYA_API_KEY = os.environ.get("SHOONYA_API_KEY", "")
 TOKEN_NIFTY = '26000' 
 EXCHANGE = 'NSE'
 
-# Hyperparameters (UPDATED)
+# Hyperparameters
 INPUT_SEQ_LEN = 10     
 INPUT_FEATURES = 5     
 HIDDEN_SIZE = 64       
-LEARNING_RATE = 0.002      # Updated to 0.002
-DELAY_SECONDS = 1800       # 30 Minutes
+LEARNING_RATE = 0.005  
+DELAY_SECONDS = 1800    
 MIN_TRADES_STATS = 50  
-BATCH_SIZE = 2             # Train on 2 Q objects at a time
+BATCH_SIZE = 4          
 
 # ==========================================
-# 3. HELPER FUNCTIONS
+# 3. HELPER FUNCTIONS (Including MongoDB DB Logic)
 # ==========================================
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -94,6 +98,57 @@ def parse_shoonya_time(time_str):
         except Exception:
             return time.time()
 
+# MongoDB Setup
+db_client = None
+weights_collection = None
+if MONGO_URI:
+    try:
+        db_client = pymongo.MongoClient(MONGO_URI)
+        db = db_client["ProjectP_DB"]
+        weights_collection = db["model_weights"]
+        logger.info("MongoDB Connected Successfully.")
+    except Exception as e:
+        logger.error(f"MongoDB Connection Failed: {e}")
+
+def load_weights_from_mongo(model):
+    """Pulls the binary weights from MongoDB and loads them into the model."""
+    if weights_collection is None:
+        return False
+    try:
+        doc = weights_collection.find_one({"_id": "latest_weights"})
+        if doc and "weights" in doc:
+            buffer = io.BytesIO(doc["weights"])
+            state_dict = torch.load(buffer, weights_only=True)
+            model.load_state_dict(state_dict)
+            logger.info("Model weights successfully loaded from MongoDB.")
+            return True
+        else:
+            logger.info("No existing weights found in MongoDB. Starting fresh.")
+            return False
+    except Exception as e:
+        logger.error(f"Failed to load weights from MongoDB: {e}")
+        return False
+
+def save_weights_to_mongo(model):
+    """Saves the current model weights to MongoDB as a binary stream."""
+    if weights_collection is None:
+        return
+    try:
+        buffer = io.BytesIO()
+        torch.save(model.state_dict(), buffer)
+        buffer.seek(0)
+        binary_weights = Binary(buffer.read())
+        
+        # Upsert ensures we overwrite the old weights instead of creating new documents
+        weights_collection.update_one(
+            {"_id": "latest_weights"},
+            {"$set": {"weights": binary_weights, "updated_at": time.time()}},
+            upsert=True
+        )
+        logger.info("Model weights backed up to MongoDB.")
+    except Exception as e:
+        logger.error(f"Failed to save weights to MongoDB: {e}")
+
 # ==========================================
 # 4. DATA MANAGEMENT
 # ==========================================
@@ -101,7 +156,7 @@ class DataManager:
     def __init__(self):
         self.history = deque(maxlen=INPUT_SEQ_LEN)
         self.api = NorenApi(host='https://api.shoonya.com/NorenWClientTP/', 
-                           websocket='wss://api.shoonya.com/NorenWSTP/')
+                            websocket='wss://api.shoonya.com/NorenWSTP/')
         self.last_login_time = 0
         self.last_price = 0.0 
         self.login()
@@ -135,7 +190,6 @@ class DataManager:
             else:
                 return None, None, False
 
-            # Anti-Stagnation Lock
             if current_price == self.last_price:
                  return None, current_price, False
             self.last_price = current_price
@@ -182,7 +236,6 @@ class DataManager:
             return None, None, False
 
     def get_IT_tensor(self):
-        """Returns the IT object (10 snapshots) as a tensor"""
         data_list = list(self.history)
         if len(data_list) < INPUT_SEQ_LEN:
             missing = INPUT_SEQ_LEN - len(data_list)
@@ -210,16 +263,15 @@ if __name__ == "__main__":
     keep_alive()
     bot = ProjectP_Net()
     optimizer = optim.Adam(bot.parameters(), lr=LEARNING_RATE)
-    
-    # CrossEntropyLoss for labeled classification (1 or 0)
     loss_fn = nn.CrossEntropyLoss() 
     
-    data_manager = DataManager()
+    # Check Mongo for existing weights and load them before starting
+    load_weights_from_mongo(bot)
     
-    # Architectures
-    queue_E = deque(maxlen=4)                 # Stores the last 4 Q objects: (IT, label)
-    win_loss_queue = deque(maxlen=1000)       # Strictly for Win Rate % calculation
-    pending_IT_objects = []                   # Stores IT objects waiting for 30m label
+    data_manager = DataManager()
+    queue_E = deque(maxlen=4)                 
+    win_loss_queue = deque(maxlen=1000)       
+    pending_IT_objects = []                   
 
     logger.info("--- PROJECT P: SUPERVISED LEARNING ONLINE ---")
     send_telegram("🚀 PROJECT P: Core Architecture Upgraded.\nStatus: Monitoring Market...")
@@ -227,14 +279,11 @@ if __name__ == "__main__":
     while True:
         loop_start = time.time()
         
-        # 1. Sense
         packet, current_price, is_active = data_manager.fetch_market_data()
         
         if is_active and packet:
-            # MARKET IS OPEN AND MOVING
             data_manager.history.append(packet)
             
-            # 2. Evaluate T-30 Data & Create Q objects
             for item in pending_IT_objects[:]:
                 if loop_start - item['timestamp'] >= DELAY_SECONDS:
                     diff = current_price - item['entry_price']
@@ -243,37 +292,34 @@ if __name__ == "__main__":
                         pending_IT_objects.remove(item)
                         continue
 
-                    # Decide the label: 1 if UP, 0 if DOWN
                     label = 1 if diff > 0 else 0
-                    
-                    # Create Q object = (IT_tensor, label) and append to Queue E
                     Q = (item['it_tensor'], label)
                     queue_E.append(Q)
                     
-                    # Track Win/Loss strictly for Telegram Stats
                     did_win = (item['pred_action'] == label)
                     win_loss_queue.append(1 if did_win else 0)
                     
                     pending_IT_objects.remove(item)
                     logger.info(f" > Object Q created. Label: {label}. Prediction was: {'WIN' if did_win else 'LOSS'}")
 
-            # 3. Supervised Batch Training (Size 2)
+            # Supervised Batch Training (1 time per cycle, 2 Q objects per batch)
             if len(queue_E) >= BATCH_SIZE:
-                # Randomly sample 2 'Q' objects from Queue 'E'
-                batch = random.sample(list(queue_E), BATCH_SIZE)
+                batch = random.sample(list(queue_E), 2)
                 
-                # Extract IT data and Labels
-                inputs = torch.cat([b[0] for b in batch], dim=0) # Shape: (2, 10, 5)
-                labels = torch.tensor([b[1] for b in batch], dtype=torch.long) # Shape: (2,)
+                inputs = torch.cat([b[0] for b in batch], dim=0) 
+                labels = torch.tensor([b[1] for b in batch], dtype=torch.long) 
                 
                 optimizer.zero_grad()
                 preds = bot(inputs) 
                 loss = loss_fn(preds, labels)
                 loss.backward()
                 optimizer.step()
+            
                 logger.info(f" > Batch Training Executed. Loss: {loss.item():.4f}")
+                
+                # Automatically save the newly updated weights to MongoDB
+                save_weights_to_mongo(bot)
 
-            # 4. Predict Current State (5-min Telegram System)
             if len(data_manager.history) > 0:
                 with torch.no_grad():
                     it_tensor = data_manager.get_IT_tensor()
@@ -284,9 +330,8 @@ if __name__ == "__main__":
 
                 msg = (f"📡 P-REPORT\nPred: {direction}\nPrice: {current_price}\nWinRate: {win_rate}")
                 logger.info(f"Pred: {direction} | Price: {current_price} | WR: {win_rate}")
-                send_telegram(msg) # Telegram message sent every 5 mins!
+                send_telegram(msg) 
                 
-                # Store the IT object to be labeled 30 mins later
                 pending_IT_objects.append({
                     'timestamp': loop_start,
                     'it_tensor': it_tensor,
@@ -296,6 +341,5 @@ if __name__ == "__main__":
         else:
             logger.info(f"💤 Market Idle. Last Price: {current_price if current_price else 'Unknown'}")
 
-        # 5. Wait
         elapsed = time.time() - loop_start
         time.sleep(max(0, 300 - elapsed))

@@ -5,3 +5,4 @@ torch
 NorenRestApiPy
 pyotp
 websocket-client
+pymongo
